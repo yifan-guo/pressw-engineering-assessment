@@ -15,8 +15,13 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from . import db
+from .crew.legacy import router as crew_legacy_router
+from .crew.v3 import router as crew_v3_router
 
 app = FastAPI(title="encore")
+
+app.include_router(crew_legacy_router)
+app.include_router(crew_v3_router)
 
 
 @app.get("/healthz")
