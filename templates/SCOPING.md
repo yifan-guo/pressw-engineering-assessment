@@ -2,7 +2,13 @@
 
 - **Scope committed:** what you're actually building, as a tight list
 
-Encore: crew list + crew show (legacy wrappers + /v3 equivalents). Parity proven by response + DB snapshot comparison. routes.yaml flipped for org 7
+Wave 1 for org 7:
+
+- Legacy wrappers: `GET /callboard/crew/list`, `GET /callboard/crew/show`, `POST /callboard/crew/update`
+- Modern API: `GET /v3/crew`, `GET /v3/crew/{id}`, `PATCH /v3/crew/{id}`
+- Shared service over `tg_crew` (one implementation)
+- `routes.yaml` flips those three `/callboard/crew/*` paths for org 7 to Encore
+- Parity proof: `templates/PARITY.md` + `encore/tests/test_crew_migration.py`
 
 # Crew API: legacy vs /v3
 
@@ -26,13 +32,12 @@ Encore when ready; leave `/v3/` as a new path that only modern clients call.
 | No `result` / `data` / `tg_flash` envelope | HTTP status already conveys success/failure. Extra envelope adds noise and forces every client to unwrap. |
 | Collection key `items` | Standard, unambiguous. Avoids the legacy singular `"crew"` array name. |
 | Resource id field `id` | Conventional REST. Legacy keeps `crew_id` for compatibility. |
-| `user_name` + `display_name` (no email-as-`crew_name`) | Callboard overloads `crew_name` with the email address. That is surprising and forces clients to keep a second field for the human name. `/v3` uses clear names. |
-| `rate` as number | Avoids parsing `"31.00"` everywhere. Money remains decimal-safe at the DB boundary. |
-| `is_lead` as boolean | Eliminates `"Y"`/`"N"` string checks and case sensitivity. |
-| `prefs` as parsed object | Callboard returns a JSON *string*. Clients already have to `JSON.parse`; `/v3` does it once at the boundary. |
-| Pagination includes `per_page` | Clients need to know the page size they received. Legacy omits it from the body even when the query param is used. |
-| Missing resource → HTTP 404 | Standard. Legacy returns `200` + `{ "result": "fail", "error": "not found" }`. |
-| List does not silently drop fields | `/v3` returns a consistent resource shape; clients do not have to special-case “list vs show”. |
+| `email` (DB `user_name`) | Callboard overloads `crew_name` with the email address. `/v3` names it. |
+| `rate` as number | Avoids parsing `"31.00"` everywhere. |
+| `is_lead` as boolean | Eliminates `"Y"`/`"N"` string checks. |
+| `prefs` as parsed object | Callboard returns a JSON *string*. `/v3` parses at the boundary. |
+| Missing resource → HTTP 404 | Standard. Legacy returns a fail envelope. |
+| Update via PATCH JSON `{notes}` | Form posts stay on the legacy path only. |
 
 ## Side-by-side field mapping (same underlying row)
 
@@ -41,39 +46,49 @@ Encore when ready; leave `/v3/` as a new path that only modern clients call.
 | Envelope | `{ result, data, tg_flash }` | none (body is the resource) |
 | Collection | `data.crew` | `items` |
 | Id | `crew_id` | `id` |
-| Login / email | `crew_name` (the email) | `user_name` |
+| Login / email | `crew_name` (the email) | `email` |
 | Human name | `display_name` | `display_name` |
 | Rate | string `"31.00"` | number `31.0` |
 | Lead flag | string `"Y"` / `"N"` | boolean `true` / `false` |
 | Notes | `notes` | `notes` |
 | Org | `org` | `org` |
-| Prefs | raw JSON string (show only) | parsed object |
-| Created | not present on list/show | `created` (unix epoch) |
-| Org name | not present | `org_name` |
-| Pagination body | `page`, `total` only | `page`, `per_page`, `total` |
-| Not found | `{ "result": "fail", "error": "not found" }` | HTTP 404 |
+| Prefs | raw JSON string (show only) | parsed object (show/get) |
+| Pagination body | `page`, `total` | `page`, `total` |
+| Not found | `{ result: fail, data: null, tg_flash }` | HTTP 404 |
 
 ## What we deliberately did *not* change in the legacy wrappers
 
+- Envelope (`result`, `data`, `tg_flash`)
+- `crew_name` = email, `rate` as string, `is_lead` as `"Y"`/`"N"`
+- Update accepts form fields, not JSON
+- Update response omits `prefs` (matches captured Callboard traffic)
 
 ## Current status
 
-- Read parity (list + show + not-found) is established against live Callboard for the traffic indices that exercise those endpoints.
-- Writes (`POST /callboard/crew/update`) are **not** implemented on Encore → 404. Deliberate scope cut for this wave.
-- `/v3` is available for new clients and for characterization tests that want the clean shape.
+- list + show + update implemented on Encore
+- Org 7 routed to Encore for those three paths only
+- Parity method documented in `templates/PARITY.md`
+- Mixed-routing tests in `encore/tests/test_crew_migration.py`
 
 ## How a client chooses the shape
 
-- Old frontend → keeps calling `/callboard/crew/...`. When `routes.yaml` points that prefix at Encore for an org, it still receives the legacy shape.
-- New client → calls `/v3/crew`. Add a `/v3/` rule in `routes.yaml` (default `encore`) if you want those requests to go through the gateway; otherwise hit Encore directly on 8092 during development.
-
-
+- Old frontend → keeps calling `/callboard/crew/...`. When `routes.yaml` points that path at Encore for an org, it still receives the legacy shape.
+- New client → calls `/v3/crew` on Encore (8092).
 
 - **Scope cut:** what you considered and decided not to do, with reasoning
-All writes, All writes, messaging, background job, assignment flow. Each has multi-table side-effects that need more probe time than remaining window
+
+Assignments, shifts, messages, `callboard_queue` / 5-minute job. Each has
+multi-table side-effects (proven for accept → shift derived columns). Not
+enough window to characterize every writer.
+
 - **Assumptions made:** what you decided without asking
-Callboard only writes to tg_crew via the explicit /crew/update endpoint. 
-Writes are atomic.
+
+Callboard only writes `tg_crew` via `/crew/update` (no job mutation observed).
+Update only mutates `notes` (only field in recorded traffic).
 
 - **Risks accepted:** what could bite later and why you're accepting it
-If a callboard job mutates crew table, org 7 will see stale data (check the other systems logs) until the /crew/update service is also migrated and or dual-written.
+
+If a hidden Callboard job later mutates crew notes for org 7, Encore reads
+will still see it (same table). The residual risk is a *second writer* we
+haven't found, not stale cache. Accepted for this window; listed as an open
+question in `SEAMS.md`.

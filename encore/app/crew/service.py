@@ -1,62 +1,124 @@
-"""Shared business logic for crew reads against tg_crew.
+"""Shared crew business logic.
 
-One place that talks to the DB. Both legacy wrappers and /v3 endpoints call this.
+One place that talks to tg_crew. Both the legacy wrappers and the /v3 endpoints
+call into this module so the migration doesn't duplicate query/update rules.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from .. import db
+
+def _row_to_dict(row: Any) -> dict[str, Any]:
+    """Map a tg_crew row to a plain dict (DB column names)."""
+    return {
+        "id": row.id,
+        "org": row.org,
+        "user_name": row.user_name,
+        "display_name": row.display_name,
+        "rate": row.rate,
+        "is_lead": row.is_lead,
+        "notes": row.notes or "",
+        "prefs_blob": row.prefs_blob,
+    }
 
 
-def get_crew_rows(
+def list_crew(
+    session: Session,
     org: int,
     *,
-    crew_id: int | None = None,
-    page: int | None = None,
+    page: int = 1,
     per_page: int | None = None,
-) -> list[dict[str, Any]]:
-    """Return raw crew rows for an org, optionally filtered and paginated.
+) -> tuple[list[dict[str, Any]], int]:
+    """Return (rows, total) for an org, optionally paginated.
 
-    Returns list of dicts with keys matching tg_crew columns (plus any
-    computed fields we need). Pagination is 1-based; per_page=0 means "all".
+    per_page=0 or None means return all rows (matches Callboard quirk).
     """
-    clauses = ["org = :org"]
-    params: dict[str, Any] = {"org": org}
+    total = session.execute(
+        text("SELECT COUNT(*) FROM tg_crew WHERE org = :org"),
+        {"org": org},
+    ).scalar_one()
 
-    if crew_id is not None:
-        clauses.append("id = :crew_id")
-        params["crew_id"] = crew_id
-
-    where = " AND ".join(clauses)
-    # Stable order so pagination and list responses are deterministic.
-    sql = f"""
-        SELECT id, org, org_name, user_name, display_name, password, rate,
-               is_lead, notes, prefs_blob, created
-        FROM tg_crew
-        WHERE {where}
-        ORDER BY id
-    """
-
-    # Apply pagination only when both page and a positive per_page are given.
-    # Legacy quirk: per_page=0 (or missing) often means "return everything".
-    if page is not None and per_page is not None and per_page > 0:
-        offset = max(page - 1, 0) * per_page
-        sql += " LIMIT :limit OFFSET :offset"
-        params["limit"] = per_page
-        params["offset"] = offset
-
-    with db.session() as s:
-        rows = s.execute(text(sql), params).mappings().all()
-        return [dict(r) for r in rows]
-
-
-def count_crew(org: int) -> int:
-    """Total crew members for an org (for pagination metadata)."""
-    with db.session() as s:
-        return s.execute(
-            text("SELECT COUNT(*) FROM tg_crew WHERE org = :org"),
+    if per_page is None or per_page == 0:
+        rows = session.execute(
+            text(
+                """
+                SELECT id, org, user_name, display_name, rate, is_lead, notes, prefs_blob
+                FROM tg_crew
+                WHERE org = :org
+                ORDER BY id
+                """
+            ),
             {"org": org},
-        ).scalar_one()
+        ).fetchall()
+    else:
+        offset = max(page - 1, 0) * per_page
+        rows = session.execute(
+            text(
+                """
+                SELECT id, org, user_name, display_name, rate, is_lead, notes, prefs_blob
+                FROM tg_crew
+                WHERE org = :org
+                ORDER BY id
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {"org": org, "limit": per_page, "offset": offset},
+        ).fetchall()
+
+    return [_row_to_dict(r) for r in rows], int(total)
+
+
+def get_crew(session: Session, org: int, crew_id: int) -> dict[str, Any] | None:
+    """Return one crew row scoped to org, or None if missing / wrong org."""
+    row = session.execute(
+        text(
+            """
+            SELECT id, org, user_name, display_name, rate, is_lead, notes, prefs_blob
+            FROM tg_crew
+            WHERE id = :id AND org = :org
+            """
+        ),
+        {"id": crew_id, "org": org},
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_dict(row)
+
+
+def update_crew_notes(
+    session: Session,
+    org: int,
+    crew_id: int,
+    notes: str,
+) -> dict[str, Any] | None:
+    """Update notes for a crew member in this org. Returns the updated row or None.
+
+    Observed Callboard behavior (traffic index 10): only the notes column changes.
+    Org scoping is enforced so one org cannot mutate another's crew.
+    """
+    result = session.execute(
+        text(
+            """
+            UPDATE tg_crew
+            SET notes = :notes
+            WHERE id = :id AND org = :org
+            RETURNING id, org, user_name, display_name, rate, is_lead, notes, prefs_blob
+            """
+        ),
+        {"id": crew_id, "org": org, "notes": notes},
+    )
+    row = result.fetchone()
+    if row is None:
+        return None
+    session.commit()
+    return _row_to_dict(row)
+
+
+def format_rate(rate: Any) -> str:
+    """Callboard returns rate as a string with two decimal places."""
+    if rate is None:
+        return "0.00"
+    return f"{float(rate):.2f}"

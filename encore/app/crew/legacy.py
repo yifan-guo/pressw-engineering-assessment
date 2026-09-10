@@ -1,109 +1,108 @@
-"""Legacy /callboard/crew/... wrappers.
+"""Legacy-compatible /callboard/crew/* wrappers.
 
-These must produce the exact wire shape Callboard returns so the existing
-frontend cannot tell the difference. Shape captured from live Callboard
-responses (org 3/7/12, list + show + not-found).
+These must match Callboard's wire format exactly so the existing frontend
+cannot tell which backend answered. Shared logic lives in service.py.
 """
 from __future__ import annotations
 
-from decimal import Decimal
-from typing import Any
+from fastapi import APIRouter, Form, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
 
-from fastapi import APIRouter, Header, Query
-
+from .. import db
 from . import service
 
-router = APIRouter(prefix="/callboard/crew", tags=["legacy-crew"])
+router = APIRouter(tags=["crew-legacy"])
 
 
-def _rate_str(rate: Any) -> str:
-    if isinstance(rate, Decimal):
-        return f"{rate:.2f}"
-    if rate is None:
-        return "0.00"
-    return f"{float(rate):.2f}"
+def _require_org(x_org_id: str | None) -> int:
+    if not x_org_id:
+        raise HTTPException(status_code=400, detail={"error": "missing org", "result": "fail"})
+    try:
+        return int(x_org_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid org", "result": "fail"}) from exc
 
 
-def _list_item(row: dict[str, Any]) -> dict[str, Any]:
-    """List item shape: Callboard uses crew_name = user_name (email).
-
-    Observed fields on list (no org_name, created, or prefs):
-      crew_id, crew_name, display_name, is_lead, notes, org, rate
-    """
+def _crew_list_item(row: dict) -> dict:
+    """Shape used inside list responses (no prefs)."""
     return {
         "crew_id": row["id"],
-        "crew_name": row.get("user_name") or "",
-        "display_name": row.get("display_name") or "",
-        "is_lead": (row.get("is_lead") or "N").upper()[:1],
-        "notes": row.get("notes") or "",
+        "crew_name": row["user_name"],
+        "display_name": row["display_name"],
+        "is_lead": row["is_lead"] or "N",
+        "notes": row["notes"] or "",
         "org": row["org"],
-        "rate": _rate_str(row.get("rate")),
+        "rate": service.format_rate(row["rate"]),
     }
 
 
-def _show_item(row: dict[str, Any]) -> dict[str, Any]:
-    """Show item shape: same as list plus prefs (raw JSON string)."""
-    item = _list_item(row)
-    item["prefs"] = row.get("prefs_blob") or ""
+def _crew_show_item(row: dict) -> dict:
+    """Shape used by show (includes prefs as string)."""
+    item = _crew_list_item(row)
+    item["prefs"] = row["prefs_blob"] if row["prefs_blob"] is not None else ""
     return item
 
 
-@router.get("/list")
+def _crew_update_item(row: dict) -> dict:
+    """Shape returned by update (matches list item — no prefs)."""
+    return _crew_list_item(row)
+
+
+def _ok(data: dict) -> dict:
+    return {"result": "ok", "data": data, "tg_flash": None}
+
+
+@router.get("/callboard/crew/list")
 def crew_list(
-    x_org_id: int = Header(..., alias="X-Org-Id"),
-    page: int | None = Query(None),
-    per_page: int | None = Query(None),
+    x_org_id: str | None = Header(default=None, alias="X-Org-Id"),
+    page: int = Query(default=1),
+    per_page: int = Query(default=25),
 ):
-    """GET /callboard/crew/list
-
-    Callboard response shape:
-      {
-        "result": "ok",
-        "data": { "crew": [...], "page": N, "total": N },
-        "tg_flash": null
-      }
-    per_page is accepted as a query param (and applied) but is not echoed
-    back in the response body.
-    """
-    effective_page = page if page is not None else 1
-    # Callboard treats missing / 0 / negative as "all"
-    effective_per = per_page if (per_page is not None and per_page > 0) else None
-
-    rows = service.get_crew_rows(
-        x_org_id,
-        page=effective_page if effective_per else None,
-        per_page=effective_per,
-    )
-    total = service.count_crew(x_org_id)
-
-    return {
-        "result": "ok",
-        "data": {
-            "crew": [_list_item(r) for r in rows],
-            "page": effective_page,
+    org = _require_org(x_org_id)
+    with db.session() as session:
+        rows, total = service.list_crew(session, org, page=page, per_page=per_page)
+    return _ok(
+        {
+            "crew": [_crew_list_item(r) for r in rows],
+            "page": page if per_page else 1,
             "total": total,
-        },
-        "tg_flash": None,
-    }
+        }
+    )
 
 
-@router.get("/show")
+@router.get("/callboard/crew/show")
 def crew_show(
-    x_org_id: int = Header(..., alias="X-Org-Id"),
     crew_id: int = Query(...),
+    x_org_id: str | None = Header(default=None, alias="X-Org-Id"),
 ):
-    """GET /callboard/crew/show?crew_id=N
+    org = _require_org(x_org_id)
+    with db.session() as session:
+        row = service.get_crew(session, org, crew_id)
+    if row is None:
+        # Callboard-style failure envelope rather than a bare 404 body.
+        return JSONResponse(
+            status_code=200,
+            content={"result": "fail", "data": None, "tg_flash": "crew not found"},
+        )
+    return _ok(_crew_show_item(row))
 
-    Success:
-      { "result": "ok", "data": { ...fields + prefs }, "tg_flash": null }
-    Missing:
-      { "result": "fail", "error": "not found" }
+
+@router.post("/callboard/crew/update")
+def crew_update(
+    crew_id: int = Form(...),
+    notes: str = Form(default=""),
+    x_org_id: str | None = Header(default=None, alias="X-Org-Id"),
+):
+    """POST form: crew_id + notes (observed traffic index 10).
+
+    Only notes is written. Response shape matches list item (no prefs).
     """
-    rows = service.get_crew_rows(x_org_id, crew_id=crew_id)
-    if not rows:
-        return {"result": "fail", "error": "not found"}
-    return {
-        "result": "ok",
-        "data": _show_item(rows[0]),
-        "tg_flash": None,
-    }
+    org = _require_org(x_org_id)
+    with db.session() as session:
+        row = service.update_crew_notes(session, org, crew_id, notes)
+    if row is None:
+        return JSONResponse(
+            status_code=200,
+            content={"result": "fail", "data": None, "tg_flash": "crew not found"},
+        )
+    return _ok(_crew_update_item(row))

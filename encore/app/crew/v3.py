@@ -1,95 +1,108 @@
-"""Modern /v3/crew/... endpoints.
+"""Modern /v3/crew endpoints.
 
-Clean shape: proper types (bool, number), no legacy envelope, predictable
-pagination. These deliberately do *not* reproduce Callboard quirks.
+Clean shapes for 2026 clients. Same service layer as the legacy wrappers;
+no result/data/tg_flash envelope, proper types, no single-char flags.
 """
 from __future__ import annotations
-
-from decimal import Decimal
-from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from .. import db
 from . import service
 
-router = APIRouter(prefix="/v3/crew", tags=["v3-crew"])
+router = APIRouter(prefix="/v3/crew", tags=["crew-v3"])
 
 
 class CrewOut(BaseModel):
     id: int
     org: int
-    org_name: str | None = None
-    user_name: str
-    display_name: str | None = None
+    email: str = Field(description="DB user_name")
+    display_name: str | None
     rate: float
     is_lead: bool
-    notes: str = ""
-    prefs: dict[str, Any] | None = None
-    created: int | None = None
+    notes: str
+    prefs: dict | None = None
 
 
 class CrewListOut(BaseModel):
     items: list[CrewOut]
-    total: int
     page: int
-    per_page: int
+    total: int
 
 
-def _to_crew_out(row: dict[str, Any]) -> CrewOut:
-    rate = row.get("rate")
-    if isinstance(rate, Decimal):
-        rate_f = float(rate)
-    else:
-        rate_f = float(rate or 0)
+class CrewUpdateIn(BaseModel):
+    notes: str
 
+
+def _require_org(x_org_id: str | None) -> int:
+    if not x_org_id:
+        raise HTTPException(status_code=400, detail="missing X-Org-Id")
+    try:
+        return int(x_org_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid X-Org-Id") from exc
+
+
+def _to_out(row: dict, *, include_prefs: bool = False) -> CrewOut:
     prefs = None
-    raw = row.get("prefs_blob")
-    if raw:
-        try:
-            import json
-            prefs = json.loads(raw)
-        except Exception:
-            prefs = {"raw": raw}
+    if include_prefs and row.get("prefs_blob"):
+        import json
 
+        try:
+            prefs = json.loads(row["prefs_blob"])
+        except (TypeError, ValueError):
+            prefs = None
     return CrewOut(
         id=row["id"],
         org=row["org"],
-        org_name=row.get("org_name"),
-        user_name=row.get("user_name") or "",
-        display_name=row.get("display_name"),
-        rate=rate_f,
-        is_lead=(row.get("is_lead") or "N").upper()[:1] == "Y",
-        notes=row.get("notes") or "",
+        email=row["user_name"],
+        display_name=row["display_name"],
+        rate=float(row["rate"] or 0),
+        is_lead=(row["is_lead"] or "N") == "Y",
+        notes=row["notes"] or "",
         prefs=prefs,
-        created=row.get("created"),
     )
 
 
 @router.get("", response_model=CrewListOut)
 def list_crew(
-    x_org_id: int = Header(..., alias="X-Org-Id"),
-    page: int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=200),
+    x_org_id: str | None = Header(default=None, alias="X-Org-Id"),
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=25, ge=0, le=200),
 ):
-    """GET /v3/crew — modern paginated list."""
-    rows = service.get_crew_rows(x_org_id, page=page, per_page=per_page)
-    total = service.count_crew(x_org_id)
+    org = _require_org(x_org_id)
+    with db.session() as session:
+        rows, total = service.list_crew(session, org, page=page, per_page=per_page or None)
     return CrewListOut(
-        items=[_to_crew_out(r) for r in rows],
-        total=total,
+        items=[_to_out(r) for r in rows],
         page=page,
-        per_page=per_page,
+        total=total,
     )
 
 
 @router.get("/{crew_id}", response_model=CrewOut)
 def get_crew(
     crew_id: int,
-    x_org_id: int = Header(..., alias="X-Org-Id"),
+    x_org_id: str | None = Header(default=None, alias="X-Org-Id"),
 ):
-    """GET /v3/crew/{id} — single crew member (404 if missing)."""
-    rows = service.get_crew_rows(x_org_id, crew_id=crew_id)
-    if not rows:
+    org = _require_org(x_org_id)
+    with db.session() as session:
+        row = service.get_crew(session, org, crew_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="crew not found")
-    return _to_crew_out(rows[0])
+    return _to_out(row, include_prefs=True)
+
+
+@router.patch("/{crew_id}", response_model=CrewOut)
+def update_crew(
+    crew_id: int,
+    body: CrewUpdateIn,
+    x_org_id: str | None = Header(default=None, alias="X-Org-Id"),
+):
+    org = _require_org(x_org_id)
+    with db.session() as session:
+        row = service.update_crew_notes(session, org, crew_id, body.notes)
+    if row is None:
+        raise HTTPException(status_code=404, detail="crew not found")
+    return _to_out(row, include_prefs=True)

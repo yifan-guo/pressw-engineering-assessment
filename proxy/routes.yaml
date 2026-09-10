@@ -6,27 +6,11 @@
 #
 # This file is re-read on every request. Migrating a route for an org is an edit
 # here; so is rolling it back.
-#
-# Example — org 7's crew endpoints served by Encore, everyone else stays on legacy:
-#
-#   "/callboard/crew/":
-#     default: callboard
-#     orgs:
-#       7: encore
 
 routes:
-  # Only the crew read endpoints for org 7 go to Encore
-  "/callboard/crew/list":
-    default: callboard
-    orgs:
-      7: encore
-
-  "/callboard/crew/show":
-    default: callboard
-    orgs:
-      7: encore
-
-  # Everything else (including crew/update, shifts, etc.) stays on Callboard
+  # Wave 2: update org 7 crew operations to encore 
+  # Everything else stays on Callboard
   "/callboard/":
     default: callboard
-    orgs: {} # TODO  update this once crew/update is also on Encore
+    orgs:
+      7: encore
