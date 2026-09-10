@@ -15,6 +15,18 @@
 #       7: encore
 
 routes:
+  # Only the crew read endpoints for org 7 go to Encore
+  "/callboard/crew/list":
+    default: callboard
+    orgs:
+      7: encore
+
+  "/callboard/crew/show":
+    default: callboard
+    orgs:
+      7: encore
+
+  # Everything else (including crew/update, shifts, etc.) stays on Callboard
   "/callboard/":
     default: callboard
-    orgs: {}
+    orgs: {} # TODO  update this once crew/update is also on Encore
